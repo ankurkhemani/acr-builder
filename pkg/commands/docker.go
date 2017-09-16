@@ -1,155 +1,163 @@
-package domain
+package commands
 
 import (
 	"fmt"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/Azure/acr-builder/pkg/constants"
+	"github.com/Azure/acr-builder/pkg/domain"
+	"github.com/Azure/acr-builder/pkg/gork"
 )
 
 // Vocabulary to be used to build commands
-var docker = Abstract("docker")
-var login = Abstract("login")
-var user = Abstract("-u")
-var pw = Abstract("-p")
-var build = Abstract("build")
-var file = Abstract("-f")
-var tag = Abstract("-g")
-var buildArgsFlag = Abstract("--build-arg")
-var push = Abstract("push")
-var pwd = Abstract(".")
 
-type BuildTarget struct {
-	Build BuildTask
-	Push  PushTask
-}
+const defaultDockerfilePath = "Dockerfile"
 
-type BuildTask interface {
-	Execute(runner Runner) error
-}
+var docker = domain.Abstract("docker")
+var login = domain.Abstract("login")
+var user = domain.Abstract("-u")
+var pw = domain.Abstract("-p")
+var build = domain.Abstract("build")
+var file = domain.Abstract("-f")
+var tag = domain.Abstract("-t")
+var buildArgsFlag = domain.Abstract("--build-arg")
+var push = domain.Abstract("push")
+var pwd = domain.Abstract(".")
 
-type PushTask interface {
-	Execute(runner Runner) error
-}
-
-func (t *BuildTarget) Export() []EnvVar {
-	exports := []EnvVar{}
-	appendExports(exports, t.Build)
-	appendExports(exports, t.Push)
-	return exports
-}
-
-type DockerAuthentication struct {
-	Registry AbstractString
-	Auth     DockerAuthenticationMethod
-}
-
-type DockerAuthenticationMethod interface {
-	Execute(runner Runner) error
-}
-
-func NewDockerUsernamePassword(registry AbstractString, username string, password string) *DockerUsernamePassword {
+func NewDockerUsernamePassword(registry domain.AbstractString, username string, password string) *DockerUsernamePassword {
 	return &DockerUsernamePassword{
 		registry: registry,
-		username: *Abstract(username),
-		password: *AbstractSensitive(password),
+		username: *domain.Abstract(username),
+		password: *domain.AbstractSensitive(password),
 	}
 }
 
 type DockerUsernamePassword struct {
-	registry AbstractString
-	username AbstractString
-	password AbstractString
+	registry domain.AbstractString
+	username domain.AbstractString
+	password domain.AbstractString
 }
 
-func (u *DockerUsernamePassword) Execute(runner Runner) error {
-	return runner.ExecuteCmd(*docker, *login, *user, u.username, *pw, u.password, u.registry)
+func (u *DockerUsernamePassword) Execute(runner domain.Runner) error {
+	return runner.ExecuteCmd(*docker, []domain.AbstractString{*login, *user, u.username, *pw, u.password, u.registry})
 }
 
 type DockerCustomAuthentication struct {
-	Task Task
+	Task domain.Task
 }
 
-func (u *DockerCustomAuthentication) Authenticate(runner Runner, registry AbstractString) error {
+func (u *DockerCustomAuthentication) Authenticate(runner domain.Runner, registry domain.AbstractString) error {
 	return u.Task.Execute(runner)
 }
 
-// NOTE: ensure branch is not null when creating the build task
-type DockerBuildTask struct {
-	source    SourceDescription
-	pushTo    AbstractString
-	Branch    AbstractString
-	Path      AbstractString
-	Context   AbstractString
-	BuildArgs []AbstractString
+func NewDockerBuildTarget(source domain.SourceDescription, branch, dockerfile, contextDir string, buildArgs []string, shouldPush bool, registry, imageName string) (*domain.BuildTarget, error) {
+	if shouldPush && imageName == "" {
+		return nil, fmt.Errorf("When building with dockerfile, docker image name --%s is required for pushing", constants.ArgNameDockerImage)
+	}
+	pushTo := fmt.Sprintf("%s/%s", registry, imageName)
+	return &domain.BuildTarget{
+		Build: &DockerBuildTask{
+			source:     source,
+			branch:     *domain.Abstract(branch),
+			dockerfile: *domain.Abstract(dockerfile),
+			contextDir: *domain.Abstract(contextDir),
+			buildArgs:  domain.AbstractBatch(buildArgs),
+			pushTo:     *domain.Abstract(pushTo),
+		},
+		Push: &DockerPushTask{
+			pushTo: *domain.Abstract(pushTo),
+		},
+	}, nil
 }
 
-func (t *DockerBuildTask) Execute(runner Runner) error {
-	var err error
-	if t.Branch.value != "" {
-		err = t.source.EnsureBranch(runner, t.Branch)
+type DockerBuildTask struct {
+	source     domain.SourceDescription
+	branch     domain.AbstractString
+	dockerfile domain.AbstractString
+	contextDir domain.AbstractString
+	buildArgs  []domain.AbstractString
+	pushTo     domain.AbstractString
+}
+
+func (t *DockerBuildTask) Execute(runner domain.Runner) ([]domain.ImageDependencies, error) {
+	if !t.branch.IsEmpty() {
+		err := t.source.EnsureBranch(runner, t.branch)
 		if err != nil {
-			return fmt.Errorf("Error while switching to branch %s", t.Branch.value)
+			return nil, fmt.Errorf("Error while switching to branch %s", t.branch.DisplayValue())
 		}
 	}
-	args := []AbstractString{}
-	args[0] = *build
-	if t.Path.value != "" {
-		args = append(args, *file, t.Path)
+
+	var dockerfile string
+	if t.dockerfile.IsEmpty() {
+		dockerfile = defaultDockerfilePath
+	} else {
+		dockerfile = runner.Resolve(t.dockerfile)
 	}
 
-	if t.pushTo.value != "" {
+	args := []domain.AbstractString{*build}
+	if !t.dockerfile.IsEmpty() {
+		args = append(args, *file, t.dockerfile)
+	}
+
+	if !t.pushTo.IsEmpty() {
 		args = append(args, *tag, t.pushTo)
 	}
 
-	for _, buildArg := range t.BuildArgs {
+	for _, buildArg := range t.buildArgs {
 		args = append(args, *buildArgsFlag, buildArg)
 	}
 
-	if t.Context.value != "" {
-		args = append(args, t.Context)
+	if !t.contextDir.IsEmpty() {
+		args = append(args, t.contextDir)
 	} else {
 		args = append(args, *pwd)
 	}
 
-	return runner.ExecuteCmd(*docker, args...)
+	runtime, buildtime, err := gork.ResolveDockerfileDependencies(dockerfile)
+	if err != nil {
+		// Don't fail because we can't figure out dependencies
+		logrus.Errorf("Failed to resolve dependencies for dockerfile %s", dockerfile)
+	}
+
+	return []domain.ImageDependencies{
+			domain.ImageDependencies{
+				Image:             runner.Resolve(t.pushTo),
+				RuntimeDependency: runtime,
+				BuildDependencies: buildtime,
+			}},
+		runner.ExecuteCmd(*docker, args)
 }
 
-func (t *DockerBuildTask) Export() []EnvVar {
-	return []EnvVar{
-		EnvVar{
+func (t *DockerBuildTask) Export() []domain.EnvVar {
+	return []domain.EnvVar{
+		domain.EnvVar{
 			Name:  constants.DockerfilePathVar,
-			Value: t.Path,
+			Value: t.dockerfile,
 		},
-		EnvVar{
+		domain.EnvVar{
 			Name:  constants.DockerBuildContextVar,
-			Value: t.Context,
+			Value: t.contextDir,
 		},
-		EnvVar{
+		domain.EnvVar{
 			Name:  constants.GitBranchVar,
-			Value: t.Branch,
+			Value: t.branch,
 		},
 	}
 }
 
 type DockerPushTask struct {
-	pushTo AbstractString
+	pushTo domain.AbstractString
 }
 
-func (t *DockerPushTask) Execute(runner Runner) error {
-	return runner.ExecuteCmd(*docker, *push, t.pushTo)
+func (t *DockerPushTask) Execute(runner domain.Runner) error {
+	return runner.ExecuteCmd(*docker, []domain.AbstractString{*push, t.pushTo})
 }
 
-func (t *DockerPushTask) Export() []EnvVar {
-	return []EnvVar{EnvVar{
-		Name:  constants.DockerPushImageVar,
-		Value: t.pushTo,
-	}}
-}
-
-func appendExports(input []EnvVar, obj interface{}) []EnvVar {
-	exporter, toExport := obj.(EnvExporter)
-	if toExport {
-		return append(input, exporter.Export()...)
-	}
-	return input
+func (t *DockerPushTask) Export() []domain.EnvVar {
+	return []domain.EnvVar{
+		domain.EnvVar{
+			Name:  constants.DockerPushImageVar,
+			Value: t.pushTo,
+		}}
 }

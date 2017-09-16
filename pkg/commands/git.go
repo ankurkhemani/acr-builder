@@ -1,4 +1,4 @@
-package domain
+package commands
 
 import (
 	"fmt"
@@ -7,27 +7,28 @@ import (
 	"strings"
 
 	"github.com/Azure/acr-builder/pkg/constants"
+	"github.com/Azure/acr-builder/pkg/domain"
 	"github.com/sirupsen/logrus"
 )
 
 // Vocabulary to be used to build commands
-var git = Abstract("git")
-var clone = Abstract("clone")
-var cloneBranch = Abstract("-b")
-var checkout = Abstract("checkout")
-var authTypePA = Abstract("OAuth Personal Access Token")
-var authTypeX = Abstract("OAuth X Access Token")
+var git = domain.Abstract("git")
+var clone = domain.Abstract("clone")
+var cloneBranch = domain.Abstract("-b")
+var checkout = domain.Abstract("checkout")
+var authTypePA = domain.Abstract("OAuth Personal Access Token")
+var authTypeX = domain.Abstract("OAuth X Access Token")
 
 type GitSource struct {
-	Address       AbstractString
-	InitialBranch AbstractString
-	HeadRev       AbstractString
+	Address       domain.AbstractString
+	InitialBranch domain.AbstractString
+	HeadRev       domain.AbstractString
 	Credential    GitCredential
-	TargetDir     AbstractString
+	TargetDir     domain.AbstractString
 	stale         bool
 }
 
-func (s *GitSource) EnsureSource(runner Runner) error {
+func (s *GitSource) EnsureSource(runner domain.Runner) error {
 	if err := verifyGitVersion(); err != nil {
 		logrus.Errorf("%s", err)
 	}
@@ -46,10 +47,10 @@ func (s *GitSource) EnsureSource(runner Runner) error {
 	if targetExists && !targetEmpty {
 		// target exists and not empty, we don't check out but will assume it's stale
 		s.stale = true
-		logrus.Infof("Directory %s exists, we will assume it's a valid git repository.", s.TargetDir.value)
+		logrus.Infof("Directory %s exists, we will assume it's a valid git repository.", s.TargetDir.DisplayValue())
 	} else {
-		cloneArgs := []AbstractString{*clone}
-		if s.InitialBranch.value != "" {
+		cloneArgs := []domain.AbstractString{*clone}
+		if !s.InitialBranch.IsEmpty() {
 			cloneArgs = append(cloneArgs, *cloneBranch, s.InitialBranch)
 		}
 		address, err := s.toAuthAddress(runner)
@@ -57,9 +58,9 @@ func (s *GitSource) EnsureSource(runner Runner) error {
 			return err
 		}
 		cloneArgs = append(cloneArgs, address, s.TargetDir)
-		err = runner.ExecuteCmd(*git, cloneArgs...)
+		err = runner.ExecuteCmd(*git, cloneArgs)
 		if err != nil {
-			return fmt.Errorf("Error cloning git source: %s to directory %s", s.Address.value, s.TargetDir.value)
+			return fmt.Errorf("Error cloning git source: %s to directory %s", s.Address.DisplayValue(), s.TargetDir.DisplayValue())
 		}
 	}
 
@@ -97,17 +98,17 @@ func verifyGitVersion() error {
 	return nil
 }
 
-func (s *GitSource) EnsureBranch(runner Runner, branch AbstractString) error {
-	if branch.value == "" {
+func (s *GitSource) EnsureBranch(runner domain.Runner, branch domain.AbstractString) error {
+	if branch.IsEmpty() {
 		return fmt.Errorf("Branch parameter is required for git source")
 	}
 	defer func() { s.stale = true }()
 	if s.stale {
-		err := runner.ExecuteCmd(*git, *Abstract("clean"), *Abstract("-xdf"))
+		err := runner.ExecuteCmd(*git, []domain.AbstractString{*domain.Abstract("clean"), *domain.Abstract("-xdf")})
 		if err != nil {
 			return fmt.Errorf("Failed to clean repository: %s", err)
 		}
-		err = runner.ExecuteCmd(*git, *Abstract("reset"), *Abstract("--hard"), *Abstract("HEAD"))
+		err = runner.ExecuteCmd(*git, []domain.AbstractString{*domain.Abstract("reset"), *domain.Abstract("--hard"), *domain.Abstract("HEAD")})
 		if err != nil {
 			return fmt.Errorf("Failed to discard local changes: %s", err)
 		}
@@ -116,50 +117,50 @@ func (s *GitSource) EnsureBranch(runner Runner, branch AbstractString) error {
 	if err != nil {
 		return fmt.Errorf("Failed to get authorized address, error: %s", err)
 	}
-	if s.HeadRev.value != "" {
+	if !s.HeadRev.IsEmpty() {
 		if s.stale {
-			err := runner.ExecuteCmd(*git, *Abstract("fetch"), address)
+			err := runner.ExecuteCmd(*git, []domain.AbstractString{*domain.Abstract("fetch"), *domain.Abstract("--all")})
 			if err != nil {
-				return fmt.Errorf("Error fetching from: %s", address.value)
+				return fmt.Errorf("Error fetching from: %s", address.DisplayValue())
 			}
 		}
-		err = runner.ExecuteCmd(*git, *checkout, s.HeadRev)
+		err = runner.ExecuteCmd(*git, []domain.AbstractString{*checkout, s.HeadRev})
 		if err != nil {
-			return fmt.Errorf("Error checking out revision: %s", s.HeadRev.value)
+			return fmt.Errorf("Error checking out revision: %s", s.HeadRev.DisplayValue())
 		}
 	} else {
-		err := runner.ExecuteCmd(*git, *checkout, branch)
+		err := runner.ExecuteCmd(*git, []domain.AbstractString{*checkout, branch})
 		if err != nil {
-			return fmt.Errorf("Error checking out branch %s", branch.value)
+			return fmt.Errorf("Error checking out branch %s", branch.DisplayValue())
 		}
 		if s.stale {
-			err = runner.ExecuteCmd(*git, *Abstract("pull"), address, branch)
+			err = runner.ExecuteCmd(*git, []domain.AbstractString{*domain.Abstract("pull"), address, branch})
 			if err != nil {
-				return fmt.Errorf("Failed to pull from branch %s: %s", branch.value, err)
+				return fmt.Errorf("Failed to pull from branch %s: %s", branch.DisplayValue(), err)
 			}
 		}
 	}
 	return nil
 }
 
-func (s *GitSource) Export() []EnvVar {
+func (s *GitSource) Export() []domain.EnvVar {
 	if s.Credential == nil {
-		return []EnvVar{}
+		return []domain.EnvVar{}
 	}
 	credsExport := s.Credential.Export()
 	return append(credsExport,
-		EnvVar{
+		domain.EnvVar{
 			Name:  constants.GitSourceVar,
 			Value: s.Address,
 		},
-		EnvVar{
+		domain.EnvVar{
 			Name:  constants.CheckoutDirVar,
 			Value: s.TargetDir,
 		},
 	)
 }
 
-func (s *GitSource) toAuthAddress(runner Runner) (AbstractString, error) {
+func (s *GitSource) toAuthAddress(runner domain.Runner) (domain.AbstractString, error) {
 	if s.Credential != nil {
 		return s.Credential.toAuthAddress(runner, s.Address)
 	}
@@ -167,69 +168,69 @@ func (s *GitSource) toAuthAddress(runner Runner) (AbstractString, error) {
 }
 
 type GitCredential interface {
-	toAuthAddress(runner Runner, address AbstractString) (AbstractString, error)
-	Export() []EnvVar
+	toAuthAddress(runner domain.Runner, address domain.AbstractString) (domain.AbstractString, error)
+	Export() []domain.EnvVar
 }
 
 type GitPersonalAccessToken struct {
-	user  AbstractString
-	token AbstractString
+	user  domain.AbstractString
+	token domain.AbstractString
 }
 
 func NewGitPersonalAccessToken(user string, token string) *GitPersonalAccessToken {
 	return &GitPersonalAccessToken{
-		user:  *Abstract(user),
-		token: *AbstractSensitive(token),
+		user:  *domain.Abstract(user),
+		token: *domain.AbstractSensitive(token),
 	}
 }
 
-func (s *GitPersonalAccessToken) Export() []EnvVar {
-	return []EnvVar{
-		EnvVar{
-			constants.GitUserVar,
-			s.user,
+func (s *GitPersonalAccessToken) Export() []domain.EnvVar {
+	return []domain.EnvVar{
+		domain.EnvVar{
+			Name:  constants.GitUserVar,
+			Value: s.user,
 		},
-		EnvVar{
-			constants.GitAuthTypeVar,
-			*authTypePA,
+		domain.EnvVar{
+			Name:  constants.GitAuthTypeVar,
+			Value: *authTypePA,
 		},
 	}
 }
 
-func (s *GitPersonalAccessToken) toAuthAddress(runner Runner, address AbstractString) (AbstractString, error) {
+func (s *GitPersonalAccessToken) toAuthAddress(runner domain.Runner, address domain.AbstractString) (domain.AbstractString, error) {
 	userResolved := runner.Resolve(s.user)
 	tokenResolved := runner.Resolve(s.token)
 	return insertAuth(runner, address, userResolved+":"+tokenResolved)
 }
 
 type GitXToken struct {
-	token AbstractString
+	token domain.AbstractString
 }
 
 func NewXToken(token string) *GitXToken {
-	return &GitXToken{token: *AbstractSensitive(token)}
+	return &GitXToken{token: *domain.AbstractSensitive(token)}
 }
 
-func (s *GitXToken) toAuthAddress(runner Runner, address AbstractString) (AbstractString, error) {
+func (s *GitXToken) toAuthAddress(runner domain.Runner, address domain.AbstractString) (domain.AbstractString, error) {
 	tokenResolved := runner.Resolve(s.token)
 	return insertAuth(runner, address, "x-access-token:"+tokenResolved)
 }
 
-func (s *GitXToken) Export() []EnvVar {
-	return []EnvVar{
-		EnvVar{
-			constants.GitAuthTypeVar,
-			*authTypeX,
+func (s *GitXToken) Export() []domain.EnvVar {
+	return []domain.EnvVar{
+		domain.EnvVar{
+			Name:  constants.GitAuthTypeVar,
+			Value: *authTypeX,
 		},
 	}
 }
 
-func insertAuth(runner Runner, address AbstractString, authString string) (AbstractString, error) {
+func insertAuth(runner domain.Runner, address domain.AbstractString, authString string) (domain.AbstractString, error) {
 	addressResolved := runner.Resolve(address)
 	protocolDivider := "://"
 	if !strings.Contains(addressResolved, protocolDivider) {
-		return AbstractString{}, fmt.Errorf("Git repository address %s cannot be used with Personal Access Token", addressResolved)
+		return domain.AbstractString{}, fmt.Errorf("Git repository address %s cannot be used with Personal Access Token", addressResolved)
 	}
 	addressAuthenticated := strings.Replace(addressResolved, protocolDivider, protocolDivider+authString+"@", 1)
-	return *AbstractSensitive(addressAuthenticated), nil
+	return *domain.AbstractSensitive(addressAuthenticated), nil
 }

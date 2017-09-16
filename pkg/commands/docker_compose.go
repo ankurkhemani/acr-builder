@@ -1,9 +1,11 @@
-package domain
+package commands
 
 import (
 	"fmt"
 
 	"github.com/Azure/acr-builder/pkg/constants"
+	"github.com/Azure/acr-builder/pkg/domain"
+	"github.com/Azure/acr-builder/pkg/gork"
 	"github.com/sirupsen/logrus"
 )
 
@@ -13,51 +15,50 @@ var dockerComposeSupportedFilenames = []string{
 	"docker-compose.yaml",
 }
 
-var dockerCompose = Abstract("docker-compose")
+var dockerCompose = domain.Abstract("docker-compose")
+var pull = domain.Abstract("--pull")
+var projectDirectory = domain.Abstract("--project-directory")
 
-func NewDockerComposeBuildTarget(source SourceDescription, branch string, path string, buildArgsStr []string) (*BuildTarget, error) {
-	buildArgs := make([]AbstractString, len(buildArgsStr))
-	for i, v := range buildArgsStr {
-		buildArgs[i] = *Abstract(v)
-	}
-
-	return &BuildTarget{
+func NewDockerComposeBuildTarget(source domain.SourceDescription, branch, path, projectDir string, buildArgs []string) (*domain.BuildTarget, error) {
+	return &domain.BuildTarget{
 		Build: &DockerComposeBuildTask{
-			source:    source,
-			Branch:    *Abstract(branch),
-			Path:      *Abstract(path),
-			BuildArgs: buildArgs,
+			source:           source,
+			branch:           *domain.Abstract(branch),
+			path:             *domain.Abstract(path),
+			projectDirectory: *domain.Abstract(projectDir),
+			buildArgs:        domain.AbstractBatch(buildArgs),
 		},
 		Push: &DockerComposePushTask{
-			path: *Abstract(path),
+			path: *domain.Abstract(path),
 		},
 	}, nil
 }
 
 type DockerComposeBuildTask struct {
-	source    SourceDescription
-	Branch    AbstractString
-	Path      AbstractString
-	BuildArgs []AbstractString
+	source           domain.SourceDescription
+	branch           domain.AbstractString
+	path             domain.AbstractString
+	projectDirectory domain.AbstractString
+	buildArgs        []domain.AbstractString
 }
 
-func (t *DockerComposeBuildTask) Execute(runner Runner) error {
-	var err error
-	if t.Branch.value != "" {
-		err = t.source.EnsureBranch(runner, t.Branch)
+func (t *DockerComposeBuildTask) Execute(runner domain.Runner) ([]domain.ImageDependencies, error) {
+	if !t.branch.IsEmpty() {
+		err := t.source.EnsureBranch(runner, t.branch)
 		if err != nil {
-			return fmt.Errorf("Error while switching to branch %s", t.Branch.value)
+			return nil, fmt.Errorf("Error while switching to branch %s", t.branch.DisplayValue())
 		}
 	}
-	args := []AbstractString{}
-	var targetPath AbstractString
-	if t.Path.value != "" {
-		targetPath = t.Path
+
+	args := []domain.AbstractString{}
+	var targetPath domain.AbstractString
+	if !t.path.IsEmpty() {
+		targetPath = t.path
 	} else {
 		var exists bool
 		for _, defaultFile := range dockerComposeSupportedFilenames {
-			targetPath = *Abstract(defaultFile)
-			exists, err = runner.DoesFileExist(targetPath)
+			targetPath = *domain.Abstract(defaultFile)
+			exists, err := runner.DoesFileExist(targetPath)
 			if err != nil {
 				logrus.Errorf("Unexpected error while checking for default docker compose file: %s", err)
 			}
@@ -66,42 +67,52 @@ func (t *DockerComposeBuildTask) Execute(runner Runner) error {
 			}
 		}
 		if !exists {
-			return fmt.Errorf("Failed to find docker compose file in source directory")
+			return nil, fmt.Errorf("Failed to find docker compose file in source directory")
 		}
 	}
-	// TODO: now scan for target path
-	args = append(args, *file, targetPath)
-	args = append(args, *build)
 
-	for _, buildArg := range t.BuildArgs {
+	dependencies, err := gork.ResolveDockerComposeDependencies(runner, runner.Resolve(t.projectDirectory), runner.Resolve(targetPath))
+	if err != nil {
+		// Don't fail because we can't figure out dependencies
+		logrus.Errorf("Failed to resolve dependencies for docker-compose file %s", targetPath.DisplayValue())
+	}
+
+	// TODO: now scan for target path
+	args = append(args, *file, targetPath, *build, *pull)
+
+	if !t.projectDirectory.IsEmpty() {
+		args = append(args, *projectDirectory, t.projectDirectory)
+	}
+
+	for _, buildArg := range t.buildArgs {
 		args = append(args, *buildArgsFlag, buildArg)
 	}
 
-	return runner.ExecuteCmd(*dockerCompose, args...)
+	return dependencies, runner.ExecuteCmd(*dockerCompose, args)
 }
 
-func (t *DockerComposeBuildTask) Export() []EnvVar {
-	return []EnvVar{
-		EnvVar{
+func (t *DockerComposeBuildTask) Export() []domain.EnvVar {
+	return []domain.EnvVar{
+		domain.EnvVar{
 			Name:  constants.DockerComposeFileVar,
-			Value: t.Path,
+			Value: t.path,
 		},
-		EnvVar{
+		domain.EnvVar{
 			Name:  constants.GitBranchVar,
-			Value: t.Branch,
+			Value: t.branch,
 		},
 	}
 }
 
 type DockerComposePushTask struct {
-	path AbstractString
+	path domain.AbstractString
 }
 
-func (t *DockerComposePushTask) Execute(runner Runner) error {
-	args := []AbstractString{}
-	if t.path.value != "" {
+func (t *DockerComposePushTask) Execute(runner domain.Runner) error {
+	args := []domain.AbstractString{}
+	if !t.path.IsEmpty() {
 		args = append(args, *file, t.path)
 	}
 	args = append(args, *push)
-	return runner.ExecuteCmd(*dockerCompose, args...)
+	return runner.ExecuteCmd(*dockerCompose, args)
 }
