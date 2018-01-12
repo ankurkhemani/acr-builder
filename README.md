@@ -1,6 +1,6 @@
 ## ACR builder forked under AppPlatPerf organization
 #### Build
-test
+testing
 Run `docker build --rm -t acr-builder .`. Note that acr-builder is intended to be used as a docker image.
 
 #### Usage
